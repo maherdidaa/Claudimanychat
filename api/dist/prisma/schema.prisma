@@ -1,0 +1,271 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ------------------------------------------------------------------
+// Enums
+// ------------------------------------------------------------------
+
+enum WorkspaceRole {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+enum CommentReplyMode {
+  ALL
+  SPECIFIC_KEYWORDS
+}
+
+enum AutomationLogStatus {
+  SUCCESS
+  FAILED
+  SKIPPED
+}
+
+enum FacebookPageStatus {
+  CONNECTED
+  TOKEN_EXPIRED
+  DISCONNECTED
+  ERROR
+}
+
+// ------------------------------------------------------------------
+// Core / Identity
+// ------------------------------------------------------------------
+
+model User {
+  id                String   @id @default(uuid())
+  email             String   @unique
+  passwordHash      String
+  name              String
+  isEmailVerified   Boolean  @default(false)
+  refreshTokenHash  String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  memberships       WorkspaceMember[]
+  connectedPages    FacebookPage[]     @relation("PageConnectedBy")
+  executionLogs     AutomationExecutionLog[] @relation("LogReviewedBy")
+
+  @@index([email])
+}
+
+model Workspace {
+  id        String   @id @default(uuid())
+  name      String
+  ownerId   String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  members            WorkspaceMember[]
+  facebookPages      FacebookPage[]
+  subscribers        Subscriber[]
+  tags               Tag[]
+  commentAutomations CommentAutomation[]
+
+  @@index([ownerId])
+}
+
+model WorkspaceMember {
+  id          String        @id @default(uuid())
+  workspaceId String
+  userId      String
+  role        WorkspaceRole @default(MEMBER)
+  createdAt   DateTime      @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, userId])
+  @@index([userId])
+}
+
+// ------------------------------------------------------------------
+// Facebook
+// ------------------------------------------------------------------
+
+model FacebookPage {
+  id                    String             @id @default(uuid())
+  workspaceId           String
+  pageId                String             @unique // Facebook Page ID
+  name                  String
+  pictureUrl            String?
+  pageAccessTokenEnc    String             // encrypted long-lived page access token
+  tokenExpiresAt        DateTime?
+  status                FacebookPageStatus @default(CONNECTED)
+  connectedById         String
+  webhookSubscribed     Boolean            @default(false)
+  createdAt             DateTime           @default(now())
+  updatedAt             DateTime           @updatedAt
+
+  workspace          Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  connectedBy        User               @relation("PageConnectedBy", fields: [connectedById], references: [id])
+  subscribers        Subscriber[]
+  commentAutomations CommentAutomation[]
+  executionLogs      AutomationExecutionLog[]
+
+  @@index([workspaceId])
+}
+
+model Subscriber {
+  id                String    @id @default(uuid())
+  workspaceId       String
+  facebookPageId    String
+  psid              String    // Messenger-scoped page-scoped ID
+  facebookUserId    String?   // present when known from a comment/like event
+  name              String?
+  profilePicUrl     String?
+  locale            String?
+  timezone          Int?
+  gender            String?
+  customFields      Json      @default("{}")
+  lastInteractionAt DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  workspace     Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  facebookPage  FacebookPage    @relation(fields: [facebookPageId], references: [id], onDelete: Cascade)
+  tags          SubscriberTag[]
+  executionLogs AutomationExecutionLog[]
+
+  @@unique([facebookPageId, psid])
+  @@index([workspaceId])
+  @@index([facebookUserId])
+}
+
+model Tag {
+  id          String   @id @default(uuid())
+  workspaceId String
+  name        String
+  color       String   @default("#6366F1")
+  createdAt   DateTime @default(now())
+
+  workspace   Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  subscribers SubscriberTag[]
+
+  @@unique([workspaceId, name])
+}
+
+model SubscriberTag {
+  subscriberId String
+  tagId        String
+  assignedAt   DateTime @default(now())
+
+  subscriber Subscriber @relation(fields: [subscriberId], references: [id], onDelete: Cascade)
+  tag        Tag        @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([subscriberId, tagId])
+}
+
+// ------------------------------------------------------------------
+// Comment Automation (Feature)
+// ------------------------------------------------------------------
+
+model CommentAutomation {
+  id          String @id @default(uuid())
+  workspaceId String
+  facebookPageId String
+  name        String
+  isActive    Boolean @default(true)
+
+  // Matching rules
+  replyMode      CommentReplyMode @default(ALL)
+  matchKeywords  String[]         @default([]) // used when replyMode = SPECIFIC_KEYWORDS
+  ignoreKeywords String[]         @default([])
+  replyOncePerUser Boolean        @default(true)
+
+  // Timing
+  delaySeconds Int @default(0)
+
+  // Actions on the comment itself
+  likeComment    Boolean @default(false)
+  hideComment    Boolean @default(false)
+  deleteComment  Boolean @default(false)
+  publicReplyEnabled Boolean @default(true)
+  publicReplyText    String?
+
+  // Messenger follow-up (private reply within the 24h/comment-tag window)
+  sendMessengerMessage Boolean @default(false)
+  messengerMessageText String?
+
+  // Side effects
+  assignTagIds String[] @default([])
+  customFields Json     @default("{}")
+  notes        String?
+  triggerFlowId String? // reserved for the Flow Builder feature (not yet built)
+
+  // Scheduling
+  scheduleStartAt   DateTime?
+  scheduleEndAt     DateTime?
+  activeDaysOfWeek  Int[]     @default([0,1,2,3,4,5,6]) // 0=Sunday ... 6=Saturday
+  activeHourStart   Int?      // 0-23, inclusive, in workspace timezone
+  activeHourEnd     Int?      // 0-23, inclusive
+
+  // Stats (denormalized counters, updated atomically by the processor)
+  totalTriggered      Int @default(0)
+  totalReplied        Int @default(0)
+  totalMessengerSent  Int @default(0)
+  totalLiked          Int @default(0)
+  totalHidden         Int @default(0)
+  totalDeleted         Int @default(0)
+  totalFailed         Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  workspace     Workspace                 @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  facebookPage  FacebookPage              @relation(fields: [facebookPageId], references: [id], onDelete: Cascade)
+  executionLogs AutomationExecutionLog[]
+
+  @@index([workspaceId])
+  @@index([facebookPageId, isActive])
+}
+
+// One row per (automation, commenter) used to enforce "reply once per user"
+// and to give per-execution auditability / retry support.
+model AutomationExecutionLog {
+  id               String              @id @default(uuid())
+  automationId     String
+  facebookPageId   String
+  facebookCommentId String
+  facebookUserId   String
+  subscriberId     String?
+  actionsPerformed Json                // { liked, hidden, deleted, publicReplied, messengerSent, tagsAssigned }
+  status           AutomationLogStatus
+  errorMessage     String?
+  reviewedById     String?
+  createdAt        DateTime            @default(now())
+
+  automation   CommentAutomation @relation(fields: [automationId], references: [id], onDelete: Cascade)
+  facebookPage FacebookPage      @relation(fields: [facebookPageId], references: [id], onDelete: Cascade)
+  subscriber   Subscriber?       @relation(fields: [subscriberId], references: [id])
+  reviewedBy   User?             @relation("LogReviewedBy", fields: [reviewedById], references: [id])
+
+  // Enforces "reply once per user" at the database level, not just in app logic.
+  @@unique([automationId, facebookUserId])
+  @@index([facebookCommentId])
+  @@index([automationId, createdAt])
+}
+
+// Raw inbound webhook payloads, kept for replay/debugging and retry-on-failure.
+model WebhookLog {
+  id          String   @id @default(uuid())
+  source      String   @default("facebook")
+  eventType   String
+  pageId      String?
+  payload     Json
+  processed   Boolean  @default(false)
+  processedAt DateTime?
+  error       String?
+  retryCount  Int      @default(0)
+  createdAt   DateTime @default(now())
+
+  @@index([processed, createdAt])
+  @@index([pageId])
+}
